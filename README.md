@@ -45,7 +45,7 @@ First, authenticate with qwen-code, then import credentials:
 qwen-code auth login
 
 # Import credentials to qwen-proxy
-qwen-proxy account import --name default
+qwen-proxy account login --name default
 ```
 
 ### 2. Start Server
@@ -87,7 +87,7 @@ qwen-proxy config             # Show configuration
 
 ```bash
 qwen-proxy account list                    # List all accounts
-qwen-proxy account import --name <name>    # Import from qwen-code
+qwen-proxy account login --name <name>      # Login (opens browser)
 qwen-proxy account default <id-or-name>    # Set default account
 qwen-proxy account enable <id-or-name>     # Enable an account
 qwen-proxy account disable <id-or-name>    # Disable an account
