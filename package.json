@@ -1,7 +1,7 @@
 {
   "name": "@ishan-parihar/qwen-proxy",
-  "version": "1.0.0",
-  "description": "OpenAI-compatible proxy server for Qwen OAuth API with CLI and systemd service support",
+  "version": "1.1.0",
+  "description": "OpenAI-compatible proxy server for Qwen OAuth API with multi-account support and load balancing",
   "bin": {
     "qwen-proxy": "dist/qwen-proxy"
   },
@@ -21,7 +21,9 @@
     "systemd",
     "qwen-code",
     "dashscope",
-    "api-proxy"
+    "api-proxy",
+    "multi-account",
+    "load-balancing"
   ],
   "author": "ishan-parihar",
   "license": "MIT",

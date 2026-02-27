@@ -2,20 +2,22 @@
 /**
  * Qwen Proxy CLI
  * 
- * A CLI tool to manage the Qwen Proxy Server
+ * A CLI tool to manage the Qwen Proxy Server with multi-account support
  */
 
 import { spawn } from "child_process";
-import { existsSync, readFileSync, writeFileSync, unlinkSync, mkdirSync } from "fs";
+import { existsSync, readFileSync, writeFileSync, unlinkSync, mkdirSync, openSync } from "fs";
 import { join } from "path";
 import { homedir } from "os";
-import { createInterface } from "readline";
+import { randomUUID } from "crypto";
 
-// Constants
+// Constants - use relative paths that work after bundling
 const QWEN_PROXY_DIR = join(homedir(), ".qwen-proxy");
 const PID_FILE = join(QWEN_PROXY_DIR, "server.pid");
 const LOG_FILE = join(QWEN_PROXY_DIR, "server.log");
+const ERROR_LOG_FILE = join(QWEN_PROXY_DIR, "error.log");
 const CONFIG_FILE = join(QWEN_PROXY_DIR, "config.json");
+const ACCOUNTS_FILE = join(QWEN_PROXY_DIR, "accounts.json");
 
 const DEFAULT_PORT = 3000;
 const DEFAULT_HOST = "127.0.0.1";
@@ -24,31 +26,37 @@ const HELP_TEXT = `
 Usage: qwen-proxy [command]
 
 Commands:
-  start     Start the proxy server
-  stop      Stop the proxy server
-  restart   Restart the proxy server
-  status    Show server status
-  logs      Show server logs
-  config    Configure server settings
-  -v        Show version
-  -h, help  Show this help
+  start               Start the proxy server
+  stop                Stop the proxy server
+  restart             Restart the proxy server
+  status              Show server status
+  logs                Show server logs
+  config              Configure server settings
+
+Account Commands:
+  account list        List all accounts
+  account add         Add a new account (from qwen-code)
+  account default     Set default account
+  account enable      Enable an account
+  account disable     Disable an account
+  account remove      Remove an account
+  account import      Import credentials from file
+
+Options:
+  -v                  Show version
+  -h, help            Show this help
 
 Examples:
   qwen-proxy start
   qwen-proxy start --port 8080
-  qwen-proxy stop
-  qwen-proxy status
+  qwen-proxy account list
+  qwen-proxy account add --name work
+  qwen-proxy account default <account-id>
 `;
 
-// Version from package.json
+// Version
 function getVersion(): string {
-  try {
-    const packagePath = join(__dirname, "..", "package.json");
-    const content = readFileSync(packagePath, "utf-8");
-    return JSON.parse(content).version;
-  } catch {
-    return "1.0.0";
-  }
+  return "1.1.0";
 }
 
 // Ensure directory exists
@@ -59,19 +67,38 @@ function ensureDir(): void {
 }
 
 // Load config
-function loadConfig(): { port: number; host: string } {
+function loadConfig(): { port: number; host: string; routingStrategy: string } {
   try {
     if (existsSync(CONFIG_FILE)) {
       return JSON.parse(readFileSync(CONFIG_FILE, "utf-8"));
     }
   } catch {}
-  return { port: DEFAULT_PORT, host: DEFAULT_HOST };
+  return { port: DEFAULT_PORT, host: DEFAULT_HOST, routingStrategy: "default" };
 }
 
 // Save config
-function saveConfig(config: { port: number; host: string }): void {
+function saveConfig(config: { port: number; host: string; routingStrategy?: string }): void {
   ensureDir();
   writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2));
+}
+
+// Load accounts
+function loadAccountsData(): any {
+  ensureDir();
+  if (!existsSync(ACCOUNTS_FILE)) {
+    return { accounts: {}, defaultAccountId: null };
+  }
+  try {
+    return JSON.parse(readFileSync(ACCOUNTS_FILE, "utf-8"));
+  } catch {
+    return { accounts: {}, defaultAccountId: null };
+  }
+}
+
+// Save accounts
+function saveAccountsData(data: any): void {
+  ensureDir();
+  writeFileSync(ACCOUNTS_FILE, JSON.stringify(data, null, 2), { mode: 0o600 });
 }
 
 // Check if server is running
@@ -83,14 +110,11 @@ function isRunning(): { running: boolean; pid?: number; port?: number; host?: st
   try {
     const pid = parseInt(readFileSync(PID_FILE, "utf-8").trim(), 10);
 
-    // Check if process exists
     try {
       process.kill(pid, 0);
-      
       const config = loadConfig();
       return { running: true, pid, port: config.port, host: config.host };
     } catch {
-      // Process doesn't exist, clean up
       unlinkSync(PID_FILE);
       return { running: false };
     }
@@ -99,7 +123,156 @@ function isRunning(): { running: boolean; pid?: number; port?: number; host?: st
   }
 }
 
-// Start server
+// ============================================
+// Account Commands
+// ============================================
+
+function listAccounts(): void {
+  const data = loadAccountsData();
+  const accounts = Object.values(data.accounts) as any[];
+
+  if (accounts.length === 0) {
+    console.log("No accounts configured.");
+    console.log("\nTo add an account:");
+    console.log("  1. Run 'qwen-code auth login' to authenticate");
+    console.log("  2. Run 'qwen-proxy account import' to import credentials");
+    return;
+  }
+
+  console.log("Accounts:\n");
+  console.log("  ID                                    Name      Status      Default");
+  console.log("  " + "-".repeat(70));
+
+  for (const account of accounts) {
+    const isValid = Date.now() < account.credentials.expiryDate;
+    const status = account.enabled
+      ? (isValid ? "✓ valid" : "⚠ expired")
+      : "✗ disabled";
+    const isDefault = account.id === data.defaultAccountId ? "★" : " ";
+    
+    console.log(`  ${account.id.slice(0, 36)}  ${account.name.padEnd(9)} ${status.padEnd(11)} ${isDefault}`);
+  }
+
+  console.log("");
+  console.log(`Total: ${accounts.length} account(s)`);
+  console.log(`Active: ${accounts.filter(a => a.enabled && Date.now() < a.credentials.expiryDate).length} account(s)`);
+}
+
+function importAccount(name?: string): void {
+  const qwenCredsPath = join(homedir(), ".qwen", "oauth_creds.json");
+  
+  if (!existsSync(qwenCredsPath)) {
+    console.error("No qwen-code credentials found.");
+    console.log("Please authenticate first:");
+    console.log("  qwen-code auth login");
+    return;
+  }
+
+  try {
+    const creds = JSON.parse(readFileSync(qwenCredsPath, "utf-8"));
+    
+    if (!creds.access_token) {
+      console.error("Invalid credentials file.");
+      return;
+    }
+
+    const data = loadAccountsData();
+    const accountId = randomUUID();
+
+    data.accounts[accountId] = {
+      id: accountId,
+      name: name || `account-${Object.keys(data.accounts).length + 1}`,
+      credentials: {
+        accessToken: creds.access_token,
+        tokenType: creds.token_type || "Bearer",
+        refreshToken: creds.refresh_token,
+        resourceUrl: creds.resource_url,
+        expiryDate: creds.expiry_date,
+        scope: creds.scope,
+      },
+      createdAt: Date.now(),
+      lastUsed: null,
+      requestCount: 0,
+      enabled: true,
+    };
+
+    if (!data.defaultAccountId) {
+      data.defaultAccountId = accountId;
+    }
+
+    saveAccountsData(data);
+    console.log(`Account "${data.accounts[accountId].name}" added successfully.`);
+    console.log(`ID: ${accountId}`);
+  } catch (e) {
+    console.error("Failed to import account:", e);
+  }
+}
+
+function setDefaultAccount(accountId: string): void {
+  const data = loadAccountsData();
+  
+  if (!data.accounts[accountId]) {
+    const found = Object.values(data.accounts).find((a: any) => a.name === accountId);
+    if (found) {
+      accountId = (found as any).id;
+    } else {
+      console.error(`Account not found: ${accountId}`);
+      return;
+    }
+  }
+
+  data.defaultAccountId = accountId;
+  saveAccountsData(data);
+  console.log(`Default account set to: ${data.accounts[accountId].name}`);
+}
+
+function toggleAccount(accountId: string, enabled: boolean): void {
+  const data = loadAccountsData();
+  
+  if (!data.accounts[accountId]) {
+    const found = Object.values(data.accounts).find((a: any) => a.name === accountId);
+    if (found) {
+      accountId = (found as any).id;
+    } else {
+      console.error(`Account not found: ${accountId}`);
+      return;
+    }
+  }
+
+  data.accounts[accountId].enabled = enabled;
+  saveAccountsData(data);
+  console.log(`Account "${data.accounts[accountId].name}" ${enabled ? "enabled" : "disabled"}.`);
+}
+
+function removeAccount(accountId: string): void {
+  const data = loadAccountsData();
+  
+  if (!data.accounts[accountId]) {
+    const found = Object.values(data.accounts).find((a: any) => a.name === accountId);
+    if (found) {
+      accountId = (found as any).id;
+    } else {
+      console.error(`Account not found: ${accountId}`);
+      return;
+    }
+  }
+
+  const name = data.accounts[accountId].name;
+  delete data.accounts[accountId];
+
+  if (data.defaultAccountId === accountId) {
+    const remaining = Object.keys(data.accounts);
+    data.defaultAccountId = remaining.length > 0 ? remaining[0] : null;
+  }
+
+  saveAccountsData(data);
+  console.log(`Account "${name}" removed.`);
+}
+
+// ============================================
+// Server Commands
+// ============================================
+
 async function startServer(port?: number, host?: string): Promise<void> {
   const status = isRunning();
   
@@ -114,37 +287,47 @@ async function startServer(port?: number, host?: string): Promise<void> {
   const finalPort = port || config.port;
   const finalHost = host || config.host;
 
-  // Save config
-  saveConfig({ port: finalPort, host: finalHost });
+  saveConfig({ port: finalPort, host: finalHost, routingStrategy: config.routingStrategy });
 
-  // Find server.js
-  const serverPath = join(__dirname, "server.mjs");
+  // Find server.mjs relative to this script
+  const serverPathGlobal = join(homedir(), ".bun", "install", "global", "node_modules", "@ishan-parihar", "qwen-proxy", "dist", "server.mjs");
+  const serverPathLocal = join(process.cwd(), "dist", "server.mjs");
+  const serverPathDev = join(process.cwd(), "src", "server.js");
   
-  if (!existsSync(serverPath)) {
-    console.error("Error: server.mjs not found. Please build the project first.");
+  let actualServerPath = serverPathGlobal;
+  if (existsSync(serverPathLocal)) {
+    actualServerPath = serverPathLocal;
+  } else if (existsSync(serverPathDev)) {
+    actualServerPath = serverPathDev;
+  }
+
+  if (!existsSync(actualServerPath)) {
+    console.error("Error: server not found. Please build the project first.");
     process.exit(1);
   }
 
   console.log(`Starting Qwen Proxy Server on http://${finalHost}:${finalPort}...`);
 
-  // Spawn server process
-  const serverProcess = spawn(process.execPath, [serverPath], {
+  // Open log files
+  const logFd = openSync(LOG_FILE, 'a');
+  const errorLogFd = openSync(ERROR_LOG_FILE, 'a');
+
+  const serverProcess = spawn(process.execPath, [actualServerPath], {
     detached: true,
-    stdio: ["ignore", "ignore", "ignore"],
+    stdio: ["ignore", logFd, errorLogFd],
     env: {
       ...process.env,
       PORT: String(finalPort),
       HOST: finalHost,
+      ROUTING_STRATEGY: config.routingStrategy || "default",
     },
   });
 
   serverProcess.unref();
-
-  // Save PID
   writeFileSync(PID_FILE, String(serverProcess.pid));
 
-  // Wait a bit and check if it started
-  await new Promise((resolve) => setTimeout(resolve, 1000));
+  // Wait for server to start
+  await new Promise((resolve) => setTimeout(resolve, 1500));
 
   const newStatus = isRunning();
   if (newStatus.running) {
@@ -156,12 +339,13 @@ async function startServer(port?: number, host?: string): Promise<void> {
     console.log(`\nUsage with OpenAI SDK:`);
     console.log(`  OPENAI_API_KEY=any OPENAI_BASE_URL=http://${finalHost}:${finalPort}/v1`);
   } else {
-    console.error("Failed to start server.");
+    console.error("Failed to start server. Check logs:");
+    console.error(`  cat ${LOG_FILE}`);
+    console.error(`  cat ${ERROR_LOG_FILE}`);
     process.exit(1);
   }
 }
 
-// Stop server
 function stopServer(): void {
   const status = isRunning();
 
@@ -172,19 +356,15 @@ function stopServer(): void {
 
   try {
     process.kill(status.pid!, "SIGTERM");
-    
-    // Clean up PID file
     if (existsSync(PID_FILE)) {
       unlinkSync(PID_FILE);
     }
-    
     console.log(`Server stopped (PID: ${status.pid})`);
   } catch (e) {
     console.error("Failed to stop server:", e);
   }
 }
 
-// Show status
 function showStatus(): void {
   const status = isRunning();
 
@@ -204,81 +384,27 @@ function showStatus(): void {
   console.log(`  GET  /v1/models`);
   console.log(`  POST /v1/chat/completions`);
   console.log(`  GET  /status`);
+  console.log(`  GET  /accounts`);
 
-  // Check authentication
-  const credsPath = join(homedir(), ".qwen", "oauth_creds.json");
-  if (existsSync(credsPath)) {
-    try {
-      const creds = JSON.parse(readFileSync(credsPath, "utf-8"));
-      const isValid = Date.now() < creds.expiry_date;
-      console.log(`\nAuthentication:`);
-      console.log(`  Status:      ${isValid ? "Valid" : "Expired"}`);
-      console.log(`  Resource:    ${creds.resource_url || "Unknown"}`);
-      console.log(`  Expires:     ${new Date(creds.expiry_date).toISOString()}`);
-    } catch {
-      console.log(`\nAuthentication: Unable to read credentials`);
-    }
-  } else {
-    console.log(`\nAuthentication: Not configured`);
-    console.log("Run 'qwen-code auth login' to authenticate");
+  const data = loadAccountsData();
+  const accounts = Object.values(data.accounts) as any[];
+  
+  console.log(`\nAccounts: ${accounts.length} configured`);
+  if (accounts.length > 0) {
+    const active = accounts.filter(a => a.enabled && Date.now() < a.credentials.expiryDate).length;
+    console.log(`Active: ${active} account(s)`);
   }
 }
 
-// Show logs
-function showLogs(): void {
-  if (!existsSync(LOG_FILE)) {
-    console.log("No logs found");
-    return;
-  }
+// ============================================
+// Main
+// ============================================
 
-  const logs = readFileSync(LOG_FILE, "utf-8");
-  console.log(logs);
-}
-
-// Configure server
-async function configure(): Promise<void> {
-  const rl = createInterface({
-    input: process.stdin,
-    output: process.stdout,
-  });
-
-  const currentConfig = loadConfig();
-
-  console.log("Configure Qwen Proxy Server\n");
-
-  const port = await new Promise<string>((resolve) => {
-    rl.question(`Port [${currentConfig.port}]: `, resolve);
-  });
-
-  const host = await new Promise<string>((resolve) => {
-    rl.question(`Host [${currentConfig.host}]: `, resolve);
-  });
-
-  rl.close();
-
-  const newConfig = {
-    port: parseInt(port) || currentConfig.port,
-    host: host || currentConfig.host,
-  };
-
-  saveConfig(newConfig);
-
-  console.log(`\nConfiguration saved:`);
-  console.log(`  Port: ${newConfig.port}`);
-  console.log(`  Host: ${newConfig.host}`);
-
-  const status = isRunning();
-  if (status.running) {
-    console.log("\nServer is running. Restart to apply changes:");
-    console.log("  qwen-proxy restart");
-  }
-}
-
-// Parse arguments
-function parseArgs(): { command: string; options: Record<string, string | number | boolean> } {
+function parseArgs(): { command: string; subcommand?: string; options: Record<string, any> } {
   const args = process.argv.slice(2);
   const command = args[0] || "help";
-  const options: Record<string, string | number | boolean> = {};
+  const subcommand = args[1];
+  const options: Record<string, any> = {};
 
   for (let i = 1; i < args.length; i++) {
     if (args[i].startsWith("--")) {
@@ -288,19 +414,66 @@ function parseArgs(): { command: string; options: Record<string, string | number
     }
   }
 
-  return { command, options };
+  return { command, subcommand, options };
 }
 
-// Main
 async function main(): Promise<void> {
-  const { command, options } = parseArgs();
+  const { command, subcommand, options } = parseArgs();
+
+  if (command === "account") {
+    switch (subcommand) {
+      case "list":
+      case "ls":
+        listAccounts();
+        break;
+      case "add":
+      case "import":
+        importAccount(options.name as string);
+        break;
+      case "default":
+        if (!process.argv[3]) {
+          console.error("Usage: qwen-proxy account default <account-id-or-name>");
+          process.exit(1);
+        }
+        setDefaultAccount(process.argv[3]);
+        break;
+      case "enable":
+        if (!process.argv[3]) {
+          console.error("Usage: qwen-proxy account enable <account-id-or-name>");
+          process.exit(1);
+        }
+        toggleAccount(process.argv[3], true);
+        break;
+      case "disable":
+        if (!process.argv[3]) {
+          console.error("Usage: qwen-proxy account disable <account-id-or-name>");
+          process.exit(1);
+        }
+        toggleAccount(process.argv[3], false);
+        break;
+      case "remove":
+      case "rm":
+        if (!process.argv[3]) {
+          console.error("Usage: qwen-proxy account remove <account-id-or-name>");
+          process.exit(1);
+        }
+        removeAccount(process.argv[3]);
+        break;
+      default:
+        console.log("Account commands:");
+        console.log("  list      List all accounts");
+        console.log("  add       Add a new account");
+        console.log("  default   Set default account");
+        console.log("  enable    Enable an account");
+        console.log("  disable   Disable an account");
+        console.log("  remove    Remove an account");
+    }
+    return;
+  }
 
   switch (command) {
     case "start":
-      await startServer(
-        options.port as number | undefined,
-        options.host as string | undefined
-      );
+      await startServer(options.port as number | undefined, options.host as string | undefined);
       break;
 
     case "stop":
@@ -318,11 +491,17 @@ async function main(): Promise<void> {
       break;
 
     case "logs":
-      showLogs();
+      if (!existsSync(LOG_FILE)) {
+        console.log("No logs found");
+        return;
+      }
+      console.log(readFileSync(LOG_FILE, "utf-8"));
       break;
 
     case "config":
-      await configure();
+      const currentConfig = loadConfig();
+      console.log("Current configuration:");
+      console.log(JSON.stringify(currentConfig, null, 2));
       break;
 
     case "-v":

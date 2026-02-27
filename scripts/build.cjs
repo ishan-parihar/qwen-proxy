@@ -1,5 +1,6 @@
 const esbuild = require('esbuild');
 const fs = require('fs');
+const path = require('path');
 
 // Ensure dist directory exists
 if (!fs.existsSync('dist')) {
@@ -7,6 +8,7 @@ if (!fs.existsSync('dist')) {
 }
 
 // Build CLI as CJS
+console.log('Building CLI...');
 esbuild.buildSync({
   entryPoints: ['src/cli.ts'],
   outfile: 'dist/cli.cjs',
@@ -17,9 +19,11 @@ esbuild.buildSync({
   define: {
     'import.meta.url': '""',
   },
+  external: ['express'],
 });
 
-// Build server as ESM
+// Build server as ESM with accounts bundled
+console.log('Building server...');
 esbuild.buildSync({
   entryPoints: ['src/server.js'],
   outfile: 'dist/server.mjs',
@@ -30,11 +34,16 @@ esbuild.buildSync({
   sourcemap: false,
 });
 
-// Create CLI wrapper (this must be CJS, so we use .cjs trick)
+// Create CLI wrapper
 const wrapper = `#!/usr/bin/env node
 require('./cli.cjs');
 `;
 fs.writeFileSync('dist/qwen-proxy', wrapper);
 fs.chmodSync('dist/qwen-proxy', '755');
+
+// Copy accounts module to dist
+if (!fs.existsSync('dist/accounts')) {
+  fs.mkdirSync('dist/accounts', { recursive: true });
+}
 
 console.log('Build complete!');

@@ -3,7 +3,7 @@
  * Qwen Proxy Server
  * 
  * An OpenAI-compatible proxy server that forwards requests to Qwen API
- * using OAuth authentication from qwen-code credentials.
+ * using OAuth authentication with multi-account support.
  * 
  * Usage:
  *   node server.js [--port 3000]
@@ -11,21 +11,27 @@
  * Environment variables:
  *   PORT - Server port (default: 3000)
  *   HOST - Server host (default: localhost)
+ *   ROUTING_STRATEGY - 'default' or 'round-robin' (default: default)
  */
 
 import http from 'node:http';
 import { URL } from 'node:url';
 
 import {
+  loadAccounts,
+  getAccountForRequest,
   getValidCredentials,
   resolveBaseUrl,
   buildHeaders,
-  loadCredentials,
-} from './auth.js';
+  updateAccountStats,
+  isTokenValid,
+  getDefaultAccount,
+} from './accounts/manager.js';
 
 // Configuration
 const PORT = process.env.PORT || 3000;
 const HOST = process.env.HOST || 'localhost';
+const ROUTING_STRATEGY = process.env.ROUTING_STRATEGY || 'default';
 
 // Debug logging
 const DEBUG = process.env.DEBUG === '1';
@@ -123,12 +129,22 @@ async function handleChatCompletions(req, res) {
 
   debug('Request body:', JSON.stringify(requestBody, null, 2));
 
+  // Get account for this request
+  const account = getAccountForRequest(ROUTING_STRATEGY);
+
+  if (!account) {
+    log('No available account');
+    res.writeHead(401, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'No accounts configured. Use "qwen-proxy account add" to add an account.' }));
+    return;
+  }
+
   // Get valid credentials
   let credentials;
   try {
-    credentials = await getValidCredentials();
+    credentials = await getValidCredentials(account.id);
   } catch (e) {
-    log('Auth error:', e.message);
+    log('Auth error for account', account.name, ':', e.message);
     res.writeHead(401, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: e.message }));
     return;
@@ -138,7 +154,7 @@ async function handleChatCompletions(req, res) {
   const baseUrl = resolveBaseUrl(credentials.resourceUrl);
   const endpoint = `${baseUrl}/chat/completions`;
   
-  debug('Forwarding to:', endpoint);
+  debug('Using account:', account.name, '->', endpoint);
 
   // Build headers
   const headers = buildHeaders(credentials);
@@ -163,6 +179,9 @@ async function handleChatCompletions(req, res) {
       res.end(errorText);
       return;
     }
+
+    // Update account stats
+    updateAccountStats(account.id);
 
     if (isStreaming) {
       // Stream response
@@ -206,19 +225,41 @@ async function handleModel(req, res, modelId) {
 
 // Status endpoint
 async function handleStatus(res) {
-  const credentials = loadCredentials();
-  
+  const accountsData = loadAccounts();
+  const accounts = Object.values(accountsData.accounts || {}).map(account => ({
+    id: account.id,
+    name: account.name,
+    enabled: account.enabled,
+    isValid: isTokenValid(account.credentials),
+    resourceUrl: account.credentials.resourceUrl,
+    expiryDate: account.credentials.expiryDate,
+    isDefault: account.id === accountsData.defaultAccountId,
+  }));
+
   const status = {
     status: 'ok',
-    authenticated: credentials !== null,
-    tokenValid: credentials ? Date.now() < credentials.expiryDate : false,
-    resourceUrl: credentials?.resourceUrl || null,
-    expiryDate: credentials?.expiryDate || null,
-    endpoint: credentials ? resolveBaseUrl(credentials.resourceUrl) : null,
+    routingStrategy: ROUTING_STRATEGY,
+    totalAccounts: accounts.length,
+    activeAccounts: accounts.filter(a => a.enabled && a.isValid).length,
+    accounts,
+    defaultAccountId: accountsData.defaultAccountId,
   };
 
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify(status, null, 2));
+}
+
+// Accounts API endpoint
+async function handleAccounts(req, res, method) {
+  const accountsData = loadAccounts();
+  
+  if (method === 'GET') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(accountsData, null, 2));
+  } else {
+    res.writeHead(405, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Method not allowed' }));
+  }
 }
 
 // Main request handler
@@ -251,6 +292,8 @@ async function handleRequest(req, res) {
       await handleChatCompletions(req, res);
     } else if (path === '/status' && req.method === 'GET') {
       await handleStatus(res);
+    } else if (path === '/accounts' && req.method === 'GET') {
+      await handleAccounts(req, res, req.method);
     } else if (path === '/health' && req.method === 'GET') {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ status: 'healthy' }));
@@ -270,12 +313,26 @@ const server = http.createServer(handleRequest);
 
 server.listen(PORT, HOST, () => {
   log(`Qwen Proxy Server running at http://${HOST}:${PORT}`);
+  log(`Routing strategy: ${ROUTING_STRATEGY}`);
+  log('');
+  
+  const accountsData = loadAccounts();
+  const accountCount = Object.keys(accountsData.accounts || {}).length;
+  
+  log(`Loaded ${accountCount} account(s)`);
+  
+  if (accountCount === 0) {
+    log('WARNING: No accounts configured!');
+    log('Run "qwen-proxy account add" to add an account.');
+  }
+  
   log('');
   log('Endpoints:');
   log(`  GET  http://${HOST}:${PORT}/v1/models`);
   log(`  GET  http://${HOST}:${PORT}/v1/models/:id`);
   log(`  POST http://${HOST}:${PORT}/v1/chat/completions`);
   log(`  GET  http://${HOST}:${PORT}/status`);
+  log(`  GET  http://${HOST}:${PORT}/accounts`);
   log(`  GET  http://${HOST}:${PORT}/health`);
   log('');
   log('Usage with OpenAI SDK:');

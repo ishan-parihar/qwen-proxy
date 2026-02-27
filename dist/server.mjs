@@ -4,10 +4,16 @@
 import http from "node:http";
 import { URL } from "node:url";
 
-// src/auth.js
+// src/accounts/manager.js
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+var QWEN_PROXY_DIR = join(homedir(), ".qwen-proxy");
+var ACCOUNTS_FILE = join(QWEN_PROXY_DIR, "accounts.json");
+var CONFIG_FILE = join(QWEN_PROXY_DIR, "config.json");
+var QWEN_CREDS_FILE = join(homedir(), ".qwen", "oauth_creds.json");
+var TOKEN_REFRESH_BUFFER_MS = 30 * 1e3;
 var OAUTH_CONFIG = {
   deviceCodeEndpoint: "https://chat.qwen.ai/api/v1/oauth2/device/code",
   tokenEndpoint: "https://chat.qwen.ai/api/v1/oauth2/token",
@@ -20,49 +26,102 @@ var API_ENDPOINTS = {
   dashscopeIntl: "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
   portal: "https://portal.qwen.ai/v1"
 };
-var TOKEN_REFRESH_BUFFER_MS = 30 * 1e3;
-function getCredentialsPath() {
-  return join(homedir(), ".qwen", "oauth_creds.json");
+function ensureDir() {
+  if (!existsSync(QWEN_PROXY_DIR)) {
+    mkdirSync(QWEN_PROXY_DIR, { recursive: true, mode: 448 });
+  }
 }
-function loadCredentials() {
-  const credPath = getCredentialsPath();
-  if (!existsSync(credPath)) {
-    return null;
+function loadAccounts() {
+  ensureDir();
+  if (!existsSync(ACCOUNTS_FILE)) {
+    const migrated = migrateFromQwenCode();
+    if (migrated) {
+      return loadAccounts();
+    }
+    return { accounts: {}, defaultAccountId: null };
   }
   try {
-    const content = readFileSync(credPath, "utf-8");
-    const data = JSON.parse(content);
-    if (!data.access_token) {
-      return null;
-    }
-    return {
-      accessToken: data.access_token,
-      tokenType: data.token_type || "Bearer",
-      refreshToken: data.refresh_token,
-      resourceUrl: data.resource_url,
-      expiryDate: data.expiry_date,
-      scope: data.scope
-    };
+    const content = readFileSync(ACCOUNTS_FILE, "utf-8");
+    return JSON.parse(content);
   } catch (error) {
-    console.error("Error loading credentials:", error.message);
-    return null;
+    console.error("Error loading accounts:", error.message);
+    return { accounts: {}, defaultAccountId: null };
   }
 }
-function saveCredentials(credentials) {
-  const credPath = getCredentialsPath();
-  const dir = join(homedir(), ".qwen");
-  if (!existsSync(dir)) {
-    mkdirSync(dir, { recursive: true, mode: 448 });
+function saveAccounts(data) {
+  ensureDir();
+  writeFileSync(ACCOUNTS_FILE, JSON.stringify(data, null, 2), { mode: 384 });
+}
+function migrateFromQwenCode() {
+  if (!existsSync(QWEN_CREDS_FILE)) {
+    return false;
   }
-  const data = {
-    access_token: credentials.accessToken,
-    token_type: credentials.tokenType || "Bearer",
-    refresh_token: credentials.refreshToken,
-    resource_url: credentials.resourceUrl,
-    expiry_date: credentials.expiryDate,
-    scope: credentials.scope
+  try {
+    const content = readFileSync(QWEN_CREDS_FILE, "utf-8");
+    const creds = JSON.parse(content);
+    if (!creds.access_token) {
+      return false;
+    }
+    const accountId = randomUUID();
+    const accounts = {
+      accounts: {
+        [accountId]: {
+          id: accountId,
+          name: "default",
+          credentials: {
+            accessToken: creds.access_token,
+            tokenType: creds.token_type || "Bearer",
+            refreshToken: creds.refresh_token,
+            resourceUrl: creds.resource_url,
+            expiryDate: creds.expiry_date,
+            scope: creds.scope
+          },
+          createdAt: Date.now(),
+          lastUsed: null,
+          requestCount: 0,
+          enabled: true
+        }
+      },
+      defaultAccountId: accountId
+    };
+    saveAccounts(accounts);
+    console.log("Migrated credentials from qwen-code CLI");
+    return true;
+  } catch (error) {
+    console.error("Migration error:", error.message);
+    return false;
+  }
+}
+function getAccount(accountId) {
+  const data = loadAccounts();
+  return data.accounts[accountId] || null;
+}
+function getDefaultAccount() {
+  const data = loadAccounts();
+  if (!data.defaultAccountId) {
+    return null;
+  }
+  return data.accounts[data.defaultAccountId] || null;
+}
+function updateCredentials(accountId, credentials) {
+  const data = loadAccounts();
+  if (!data.accounts[accountId]) {
+    throw new Error(`Account not found: ${accountId}`);
+  }
+  data.accounts[accountId].credentials = {
+    ...data.accounts[accountId].credentials,
+    ...credentials
   };
-  writeFileSync(credPath, JSON.stringify(data, null, 2), { mode: 384 });
+  saveAccounts(data);
+}
+function updateAccountStats(accountId) {
+  const data = loadAccounts();
+  if (!data.accounts[accountId]) {
+    return;
+  }
+  data.accounts[accountId].lastUsed = Date.now();
+  data.accounts[accountId].requestCount = (data.accounts[accountId].requestCount || 0) + 1;
+  saveAccounts(data);
 }
 function isTokenValid(credentials) {
   if (!credentials?.expiryDate || !credentials?.accessToken) {
@@ -116,18 +175,22 @@ async function refreshAccessToken(refreshToken) {
     scope: data.scope
   };
 }
-async function getValidCredentials() {
-  let credentials = loadCredentials();
-  if (!credentials) {
-    throw new Error("No credentials found. Please authenticate first using qwen-code CLI.");
+async function getValidCredentials(accountId) {
+  const account = getAccount(accountId);
+  if (!account) {
+    throw new Error(`Account not found: ${accountId}`);
   }
+  if (!account.enabled) {
+    throw new Error(`Account is disabled: ${account.name}`);
+  }
+  let credentials = account.credentials;
   if (!isTokenValid(credentials)) {
     if (!credentials.refreshToken) {
       throw new Error("Token expired and no refresh token available.");
     }
-    console.log("Token expired, refreshing...");
+    console.log(`Refreshing token for account: ${account.name}`);
     credentials = await refreshAccessToken(credentials.refreshToken);
-    saveCredentials(credentials);
+    updateCredentials(accountId, credentials);
     console.log("Token refreshed successfully.");
   }
   return credentials;
@@ -141,15 +204,43 @@ function buildHeaders(credentials) {
   };
   if (isDashScope) {
     headers["X-DashScope-CacheControl"] = "enable";
-    headers["X-DashScope-UserAgent"] = "qwen-proxy/1.0.0";
+    headers["X-DashScope-UserAgent"] = "qwen-proxy/1.1.0";
     headers["X-DashScope-AuthType"] = "qwen-oauth";
   }
   return headers;
+}
+function getNextAvailableAccount() {
+  const data = loadAccounts();
+  const enabledAccounts = Object.values(data.accounts).filter(
+    (a) => a.enabled && isTokenValid(a.credentials)
+  );
+  if (enabledAccounts.length === 0) {
+    const refreshableAccounts = Object.values(data.accounts).filter(
+      (a) => a.enabled && a.credentials.refreshToken
+    );
+    if (refreshableAccounts.length > 0) {
+      return refreshableAccounts[0];
+    }
+    return null;
+  }
+  enabledAccounts.sort((a, b) => (a.lastUsed || 0) - (b.lastUsed || 0));
+  return enabledAccounts[0];
+}
+function getAccountForRequest(strategy = "default") {
+  switch (strategy) {
+    case "round-robin":
+    case "load-balance":
+      return getNextAvailableAccount();
+    case "default":
+    default:
+      return getDefaultAccount();
+  }
 }
 
 // src/server.js
 var PORT = process.env.PORT || 3e3;
 var HOST = process.env.HOST || "localhost";
+var ROUTING_STRATEGY = process.env.ROUTING_STRATEGY || "default";
 var DEBUG = process.env.DEBUG === "1";
 function log(...args) {
   const timestamp = (/* @__PURE__ */ new Date()).toISOString();
@@ -229,18 +320,25 @@ async function handleChatCompletions(req, res) {
     return;
   }
   debug("Request body:", JSON.stringify(requestBody, null, 2));
+  const account = getAccountForRequest(ROUTING_STRATEGY);
+  if (!account) {
+    log("No available account");
+    res.writeHead(401, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: 'No accounts configured. Use "qwen-proxy account add" to add an account.' }));
+    return;
+  }
   let credentials;
   try {
-    credentials = await getValidCredentials();
+    credentials = await getValidCredentials(account.id);
   } catch (e) {
-    log("Auth error:", e.message);
+    log("Auth error for account", account.name, ":", e.message);
     res.writeHead(401, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ error: e.message }));
     return;
   }
   const baseUrl = resolveBaseUrl(credentials.resourceUrl);
   const endpoint = `${baseUrl}/chat/completions`;
-  debug("Forwarding to:", endpoint);
+  debug("Using account:", account.name, "->", endpoint);
   const headers = buildHeaders(credentials);
   const isStreaming = requestBody.stream === true;
   try {
@@ -257,6 +355,7 @@ async function handleChatCompletions(req, res) {
       res.end(errorText);
       return;
     }
+    updateAccountStats(account.id);
     if (isStreaming) {
       res.writeHead(200, {
         "Content-Type": "text/event-stream",
@@ -289,17 +388,36 @@ async function handleModel(req, res, modelId) {
   res.end(JSON.stringify(model));
 }
 async function handleStatus(res) {
-  const credentials = loadCredentials();
+  const accountsData = loadAccounts();
+  const accounts = Object.values(accountsData.accounts || {}).map((account) => ({
+    id: account.id,
+    name: account.name,
+    enabled: account.enabled,
+    isValid: isTokenValid(account.credentials),
+    resourceUrl: account.credentials.resourceUrl,
+    expiryDate: account.credentials.expiryDate,
+    isDefault: account.id === accountsData.defaultAccountId
+  }));
   const status = {
     status: "ok",
-    authenticated: credentials !== null,
-    tokenValid: credentials ? Date.now() < credentials.expiryDate : false,
-    resourceUrl: credentials?.resourceUrl || null,
-    expiryDate: credentials?.expiryDate || null,
-    endpoint: credentials ? resolveBaseUrl(credentials.resourceUrl) : null
+    routingStrategy: ROUTING_STRATEGY,
+    totalAccounts: accounts.length,
+    activeAccounts: accounts.filter((a) => a.enabled && a.isValid).length,
+    accounts,
+    defaultAccountId: accountsData.defaultAccountId
   };
   res.writeHead(200, { "Content-Type": "application/json" });
   res.end(JSON.stringify(status, null, 2));
+}
+async function handleAccounts(req, res, method) {
+  const accountsData = loadAccounts();
+  if (method === "GET") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(accountsData, null, 2));
+  } else {
+    res.writeHead(405, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "Method not allowed" }));
+  }
 }
 async function handleRequest(req, res) {
   const url = new URL(req.url, `http://${req.headers.host}`);
@@ -323,6 +441,8 @@ async function handleRequest(req, res) {
       await handleChatCompletions(req, res);
     } else if (path === "/status" && req.method === "GET") {
       await handleStatus(res);
+    } else if (path === "/accounts" && req.method === "GET") {
+      await handleAccounts(req, res, req.method);
     } else if (path === "/health" && req.method === "GET") {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ status: "healthy" }));
@@ -339,12 +459,22 @@ async function handleRequest(req, res) {
 var server = http.createServer(handleRequest);
 server.listen(PORT, HOST, () => {
   log(`Qwen Proxy Server running at http://${HOST}:${PORT}`);
+  log(`Routing strategy: ${ROUTING_STRATEGY}`);
+  log("");
+  const accountsData = loadAccounts();
+  const accountCount = Object.keys(accountsData.accounts || {}).length;
+  log(`Loaded ${accountCount} account(s)`);
+  if (accountCount === 0) {
+    log("WARNING: No accounts configured!");
+    log('Run "qwen-proxy account add" to add an account.');
+  }
   log("");
   log("Endpoints:");
   log(`  GET  http://${HOST}:${PORT}/v1/models`);
   log(`  GET  http://${HOST}:${PORT}/v1/models/:id`);
   log(`  POST http://${HOST}:${PORT}/v1/chat/completions`);
   log(`  GET  http://${HOST}:${PORT}/status`);
+  log(`  GET  http://${HOST}:${PORT}/accounts`);
   log(`  GET  http://${HOST}:${PORT}/health`);
   log("");
   log("Usage with OpenAI SDK:");
