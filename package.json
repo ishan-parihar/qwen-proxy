@@ -1,16 +1,33 @@
 {
-  "name": "qwen-proxy",
+  "name": "@ishan-parihar/qwen-proxy",
   "version": "1.0.0",
   "description": "OpenAI-compatible proxy server for Qwen OAuth API",
-  "type": "module",
-  "main": "src/server.js",
+  "bin": {
+    "qwen-proxy": "dist/qwen-proxy"
+  },
+  "main": "dist/server.mjs",
   "scripts": {
+    "build": "node scripts/build.cjs",
     "start": "node src/server.js",
     "dev": "node --watch src/server.js"
   },
-  "keywords": ["qwen", "proxy", "openai", "oauth"],
+  "keywords": ["qwen", "proxy", "openai", "oauth", "cli"],
+  "author": "ishan-parihar",
   "license": "MIT",
   "dependencies": {
     "express": "^4.18.2"
-  }
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/express": "^4.17.21",
+    "esbuild": "^0.25.0",
+    "typescript": "^5.6.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ]
 }
