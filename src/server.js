@@ -230,7 +230,7 @@ async function handleStatus(res) {
     id: account.id,
     name: account.name,
     enabled: account.enabled,
-    isValid: isTokenValid(account.credentials),
+    isValid: isTokenValid(account),
     resourceUrl: account.credentials.resourceUrl,
     expiryDate: account.credentials.expiryDate,
     isDefault: account.id === accountsData.defaultAccountId,

@@ -5,165 +5,40 @@ import http from "node:http";
 import { URL } from "node:url";
 
 // src/accounts/manager.js
-import { homedir } from "node:os";
-import { join } from "node:path";
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
-import { randomUUID } from "node:crypto";
-var QWEN_PROXY_DIR = join(homedir(), ".qwen-proxy");
-var ACCOUNTS_FILE = join(QWEN_PROXY_DIR, "accounts.json");
-var CONFIG_FILE = join(QWEN_PROXY_DIR, "config.json");
-var QWEN_CREDS_FILE = join(homedir(), ".qwen", "oauth_creds.json");
-var TOKEN_REFRESH_BUFFER_MS = 30 * 1e3;
+import { existsSync, readFileSync, writeFileSync, mkdirSync } from "fs";
+import { join } from "path";
+import { homedir } from "os";
+
+// src/auth/oauth.js
 var OAUTH_CONFIG = {
+  baseUrl: "https://chat.qwen.ai",
   deviceCodeEndpoint: "https://chat.qwen.ai/api/v1/oauth2/device/code",
   tokenEndpoint: "https://chat.qwen.ai/api/v1/oauth2/token",
   clientId: "f0304373b74a44d2b584a3fb70ca9e56",
   scope: "openid profile email model.completion",
   grantType: "urn:ietf:params:oauth:grant-type:device_code"
 };
-var API_ENDPOINTS = {
-  dashscope: "https://dashscope.aliyuncs.com/compatible-mode/v1",
-  dashscopeIntl: "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
-  portal: "https://portal.qwen.ai/v1"
-};
-function ensureDir() {
-  if (!existsSync(QWEN_PROXY_DIR)) {
-    mkdirSync(QWEN_PROXY_DIR, { recursive: true, mode: 448 });
-  }
-}
-function loadAccounts() {
-  ensureDir();
-  if (!existsSync(ACCOUNTS_FILE)) {
-    const migrated = migrateFromQwenCode();
-    if (migrated) {
-      return loadAccounts();
-    }
-    return { accounts: {}, defaultAccountId: null };
-  }
-  try {
-    const content = readFileSync(ACCOUNTS_FILE, "utf-8");
-    return JSON.parse(content);
-  } catch (error) {
-    console.error("Error loading accounts:", error.message);
-    return { accounts: {}, defaultAccountId: null };
-  }
-}
-function saveAccounts(data) {
-  ensureDir();
-  writeFileSync(ACCOUNTS_FILE, JSON.stringify(data, null, 2), { mode: 384 });
-}
-function migrateFromQwenCode() {
-  if (!existsSync(QWEN_CREDS_FILE)) {
-    return false;
-  }
-  try {
-    const content = readFileSync(QWEN_CREDS_FILE, "utf-8");
-    const creds = JSON.parse(content);
-    if (!creds.access_token) {
-      return false;
-    }
-    const accountId = randomUUID();
-    const accounts = {
-      accounts: {
-        [accountId]: {
-          id: accountId,
-          name: "default",
-          credentials: {
-            accessToken: creds.access_token,
-            tokenType: creds.token_type || "Bearer",
-            refreshToken: creds.refresh_token,
-            resourceUrl: creds.resource_url,
-            expiryDate: creds.expiry_date,
-            scope: creds.scope
-          },
-          createdAt: Date.now(),
-          lastUsed: null,
-          requestCount: 0,
-          enabled: true
-        }
-      },
-      defaultAccountId: accountId
-    };
-    saveAccounts(accounts);
-    console.log("Migrated credentials from qwen-code CLI");
-    return true;
-  } catch (error) {
-    console.error("Migration error:", error.message);
-    return false;
-  }
-}
-function getAccount(accountId) {
-  const data = loadAccounts();
-  return data.accounts[accountId] || null;
-}
-function getDefaultAccount() {
-  const data = loadAccounts();
-  if (!data.defaultAccountId) {
-    return null;
-  }
-  return data.accounts[data.defaultAccountId] || null;
-}
-function updateCredentials(accountId, credentials) {
-  const data = loadAccounts();
-  if (!data.accounts[accountId]) {
-    throw new Error(`Account not found: ${accountId}`);
-  }
-  data.accounts[accountId].credentials = {
-    ...data.accounts[accountId].credentials,
-    ...credentials
-  };
-  saveAccounts(data);
-}
-function updateAccountStats(accountId) {
-  const data = loadAccounts();
-  if (!data.accounts[accountId]) {
-    return;
-  }
-  data.accounts[accountId].lastUsed = Date.now();
-  data.accounts[accountId].requestCount = (data.accounts[accountId].requestCount || 0) + 1;
-  saveAccounts(data);
-}
-function isTokenValid(credentials) {
-  if (!credentials?.expiryDate || !credentials?.accessToken) {
-    return false;
-  }
-  return Date.now() < credentials.expiryDate - TOKEN_REFRESH_BUFFER_MS;
-}
-function resolveBaseUrl(resourceUrl) {
-  if (!resourceUrl) {
-    return API_ENDPOINTS.dashscope;
-  }
-  const normalized = resourceUrl.toLowerCase().trim();
-  if (normalized.includes("portal.qwen.ai")) {
-    return API_ENDPOINTS.portal;
-  }
-  if (normalized.includes("dashscope-intl")) {
-    return API_ENDPOINTS.dashscopeIntl;
-  }
-  if (normalized.includes("dashscope")) {
-    return API_ENDPOINTS.dashscope;
-  }
-  if (normalized.startsWith("http://") || normalized.startsWith("https://")) {
-    const url = resourceUrl.endsWith("/v1") ? resourceUrl : `${resourceUrl}/v1`;
-    return url;
-  }
-  return API_ENDPOINTS.dashscope;
+var TOKEN_REFRESH_BUFFER_MS = 30 * 1e3;
+function objectToUrlEncoded(data) {
+  return Object.keys(data).map((key) => `${encodeURIComponent(key)}=${encodeURIComponent(data[key])}`).join("&");
 }
 async function refreshAccessToken(refreshToken) {
+  const bodyData = {
+    grant_type: "refresh_token",
+    refresh_token: refreshToken,
+    client_id: OAUTH_CONFIG.clientId
+  };
   const response = await fetch(OAUTH_CONFIG.tokenEndpoint, {
     method: "POST",
     headers: {
-      "Content-Type": "application/x-www-form-urlencoded"
+      "Content-Type": "application/x-www-form-urlencoded",
+      Accept: "application/json"
     },
-    body: new URLSearchParams({
-      grant_type: "refresh_token",
-      refresh_token: refreshToken,
-      client_id: OAUTH_CONFIG.clientId
-    })
+    body: objectToUrlEncoded(bodyData)
   });
   if (!response.ok) {
-    const error = await response.text();
-    throw new Error(`Token refresh failed: ${error}`);
+    const errorText = await response.text();
+    throw new Error(`Token refresh failed: HTTP ${response.status}: ${errorText}`);
   }
   const data = await response.json();
   return {
@@ -175,66 +50,159 @@ async function refreshAccessToken(refreshToken) {
     scope: data.scope
   };
 }
-async function getValidCredentials(accountId) {
-  const account = getAccount(accountId);
-  if (!account) {
-    throw new Error(`Account not found: ${accountId}`);
+function isCredentialsExpired(credentials) {
+  if (!credentials.expiryDate) return false;
+  return Date.now() > credentials.expiryDate - TOKEN_REFRESH_BUFFER_MS;
+}
+
+// src/accounts/manager.js
+var QWEN_PROXY_DIR = join(homedir(), ".qwen-proxy");
+var ACCOUNTS_FILE = join(QWEN_PROXY_DIR, "accounts.json");
+var API_CONFIG = {
+  dashscopeBaseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+  dashscopeIntlBaseUrl: "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+  portalBaseUrl: "https://portal.qwen.ai/v1"
+};
+var DASHSCOPE_HEADERS = {
+  cacheControl: "X-DashScope-CacheControl",
+  userAgent: "X-DashScope-UserAgent",
+  authType: "X-DashScope-AuthType"
+};
+var USER_AGENT = "qwen-proxy/1.2.0";
+var lastAccountIndex = -1;
+function ensureDir() {
+  if (!existsSync(QWEN_PROXY_DIR)) {
+    mkdirSync(QWEN_PROXY_DIR, { recursive: true, mode: 448 });
   }
-  if (!account.enabled) {
-    throw new Error(`Account is disabled: ${account.name}`);
+}
+function loadAccounts() {
+  ensureDir();
+  if (!existsSync(ACCOUNTS_FILE)) {
+    return { accounts: {}, defaultAccountId: null };
   }
-  let credentials = account.credentials;
-  if (!isTokenValid(credentials)) {
-    if (!credentials.refreshToken) {
-      throw new Error("Token expired and no refresh token available.");
+  try {
+    const data = JSON.parse(readFileSync(ACCOUNTS_FILE, "utf-8"));
+    if (!data.accounts || typeof data.accounts !== "object") {
+      return { accounts: {}, defaultAccountId: null };
     }
-    console.log(`Refreshing token for account: ${account.name}`);
-    credentials = await refreshAccessToken(credentials.refreshToken);
-    updateCredentials(accountId, credentials);
-    console.log("Token refreshed successfully.");
+    return data;
+  } catch {
+    return { accounts: {}, defaultAccountId: null };
   }
-  return credentials;
+}
+function saveAccounts(data) {
+  ensureDir();
+  writeFileSync(ACCOUNTS_FILE, JSON.stringify(data, null, 2), { mode: 384 });
+}
+function getDefaultAccount() {
+  const data = loadAccounts();
+  if (!data.defaultAccountId) {
+    const enabledAccounts2 = Object.values(data.accounts).filter((a) => a.enabled);
+    return enabledAccounts2.length > 0 ? enabledAccounts2[0] : null;
+  }
+  const account = data.accounts[data.defaultAccountId];
+  if (account?.enabled) {
+    return account;
+  }
+  const enabledAccounts = Object.values(data.accounts).filter((a) => a.enabled);
+  return enabledAccounts.length > 0 ? enabledAccounts[0] : null;
+}
+function getEnabledAccounts() {
+  const data = loadAccounts();
+  return Object.values(data.accounts).filter((a) => a.enabled);
+}
+function getAccountForRequest(strategy = "default") {
+  const enabledAccounts = getEnabledAccounts();
+  if (enabledAccounts.length === 0) {
+    return null;
+  }
+  if (strategy === "round-robin" && enabledAccounts.length > 1) {
+    lastAccountIndex = (lastAccountIndex + 1) % enabledAccounts.length;
+    return enabledAccounts[lastAccountIndex];
+  }
+  return getDefaultAccount();
+}
+async function getValidCredentials(accountId) {
+  const data = loadAccounts();
+  const account = data.accounts[accountId];
+  if (!account || !account.enabled) {
+    return null;
+  }
+  if (isCredentialsExpired(account.credentials)) {
+    if (!account.credentials.refreshToken) {
+      console.error(`Account ${account.name} token expired and no refresh token available`);
+      return null;
+    }
+    try {
+      console.log(`Refreshing token for account ${account.name}...`);
+      const newCredentials = await refreshAccessToken(account.credentials.refreshToken);
+      data.accounts[accountId].credentials = {
+        accessToken: newCredentials.accessToken,
+        tokenType: newCredentials.tokenType,
+        refreshToken: newCredentials.refreshToken || account.credentials.refreshToken,
+        resourceUrl: newCredentials.resourceUrl,
+        expiryDate: newCredentials.expiryDate,
+        scope: newCredentials.scope
+      };
+      saveAccounts(data);
+      console.log(`Token refreshed for account ${account.name}`);
+      return {
+        accessToken: newCredentials.accessToken,
+        tokenType: newCredentials.tokenType,
+        resourceUrl: newCredentials.resourceUrl
+      };
+    } catch (error) {
+      console.error(`Failed to refresh token for account ${account.name}:`, error);
+      return null;
+    }
+  }
+  return {
+    accessToken: account.credentials.accessToken,
+    tokenType: account.credentials.tokenType,
+    resourceUrl: account.credentials.resourceUrl
+  };
+}
+function updateAccountStats(accountId) {
+  const data = loadAccounts();
+  if (data.accounts[accountId]) {
+    data.accounts[accountId].lastUsed = Date.now();
+    data.accounts[accountId].requestCount++;
+    saveAccounts(data);
+  }
+}
+function resolveBaseUrl(resourceUrl) {
+  if (!resourceUrl) {
+    return API_CONFIG.portalBaseUrl;
+  }
+  const normalized = resourceUrl.toLowerCase().replace(/\/+$/, "");
+  if (normalized === "portal.qwen.ai" || normalized.includes("portal.qwen.ai")) {
+    return API_CONFIG.portalBaseUrl;
+  }
+  if (normalized.includes("dashscope-intl")) {
+    return API_CONFIG.dashscopeIntlBaseUrl;
+  }
+  if (normalized.includes("dashscope")) {
+    return API_CONFIG.dashscopeBaseUrl;
+  }
+  return API_CONFIG.portalBaseUrl;
 }
 function buildHeaders(credentials) {
-  const resourceUrl = credentials.resourceUrl?.toLowerCase() || "";
-  const isDashScope = resourceUrl.includes("dashscope") || !resourceUrl;
   const headers = {
-    "Authorization": `Bearer ${credentials.accessToken}`,
-    "Content-Type": "application/json"
+    "Authorization": `${credentials.tokenType} ${credentials.accessToken}`,
+    "Content-Type": "application/json",
+    "Accept": "application/json"
   };
-  if (isDashScope) {
-    headers["X-DashScope-CacheControl"] = "enable";
-    headers["X-DashScope-UserAgent"] = "qwen-proxy/1.1.0";
-    headers["X-DashScope-AuthType"] = "qwen-oauth";
+  const baseUrl = resolveBaseUrl(credentials.resourceUrl);
+  if (baseUrl.includes("dashscope")) {
+    headers[DASHSCOPE_HEADERS.cacheControl] = "user-explicit";
+    headers[DASHSCOPE_HEADERS.userAgent] = USER_AGENT;
+    headers[DASHSCOPE_HEADERS.authType] = "OAUTH";
   }
   return headers;
 }
-function getNextAvailableAccount() {
-  const data = loadAccounts();
-  const enabledAccounts = Object.values(data.accounts).filter(
-    (a) => a.enabled && isTokenValid(a.credentials)
-  );
-  if (enabledAccounts.length === 0) {
-    const refreshableAccounts = Object.values(data.accounts).filter(
-      (a) => a.enabled && a.credentials.refreshToken
-    );
-    if (refreshableAccounts.length > 0) {
-      return refreshableAccounts[0];
-    }
-    return null;
-  }
-  enabledAccounts.sort((a, b) => (a.lastUsed || 0) - (b.lastUsed || 0));
-  return enabledAccounts[0];
-}
-function getAccountForRequest(strategy = "default") {
-  switch (strategy) {
-    case "round-robin":
-    case "load-balance":
-      return getNextAvailableAccount();
-    case "default":
-    default:
-      return getDefaultAccount();
-  }
+function isTokenValid(account) {
+  if (!account || !account.credentials) return false;
+  return !isCredentialsExpired(account.credentials);
 }
 
 // src/server.js
@@ -393,7 +361,7 @@ async function handleStatus(res) {
     id: account.id,
     name: account.name,
     enabled: account.enabled,
-    isValid: isTokenValid(account.credentials),
+    isValid: isTokenValid(account),
     resourceUrl: account.credentials.resourceUrl,
     expiryDate: account.credentials.expiryDate,
     isDefault: account.id === accountsData.defaultAccountId

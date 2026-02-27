@@ -1,6 +1,6 @@
 {
   "name": "@ishan-parihar/qwen-proxy",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "OpenAI-compatible proxy server for Qwen OAuth API with multi-account support and load balancing",
   "bin": {
     "qwen-proxy": "dist/qwen-proxy"

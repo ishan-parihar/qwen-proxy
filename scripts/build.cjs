@@ -2,48 +2,40 @@ const esbuild = require('esbuild');
 const fs = require('fs');
 const path = require('path');
 
-// Ensure dist directory exists
-if (!fs.existsSync('dist')) {
-  fs.mkdirSync('dist', { recursive: true });
-}
-
-// Build CLI as CJS
 console.log('Building CLI...');
+
+// Build CLI as CJS (avoiding ESM shebang issues in Node 25)
 esbuild.buildSync({
-  entryPoints: ['src/cli.ts'],
+  entryPoints: ['src/cli.js'],
   outfile: 'dist/cli.cjs',
-  platform: 'node',
   format: 'cjs',
+  platform: 'node',
+  target: 'node18',
   bundle: true,
-  sourcemap: false,
+  minify: false,
   define: {
     'import.meta.url': '""',
   },
-  external: ['express'],
+  external: [], // Bundle everything
 });
 
-// Build server as ESM with accounts bundled
 console.log('Building server...');
+
+// Build server as ESM
 esbuild.buildSync({
   entryPoints: ['src/server.js'],
   outfile: 'dist/server.mjs',
-  platform: 'node',
   format: 'esm',
+  platform: 'node',
+  target: 'node18',
   bundle: true,
-  external: ['express'],
-  sourcemap: false,
+  minify: false,
+  external: [], // Bundle everything
 });
 
-// Create CLI wrapper
-const wrapper = `#!/usr/bin/env node
-require('./cli.cjs');
-`;
-fs.writeFileSync('dist/qwen-proxy', wrapper);
-fs.chmodSync('dist/qwen-proxy', '755');
-
-// Copy accounts module to dist
-if (!fs.existsSync('dist/accounts')) {
-  fs.mkdirSync('dist/accounts', { recursive: true });
-}
+// Create CLI wrapper script
+const wrapperPath = path.join(__dirname, '..', 'dist', 'qwen-proxy');
+fs.writeFileSync(wrapperPath, '#!/usr/bin/env node\nrequire("./cli.cjs");');
+fs.chmodSync(wrapperPath, '755');
 
 console.log('Build complete!');

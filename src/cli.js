@@ -3,6 +3,7 @@
  * Qwen Proxy CLI
  * 
  * A CLI tool to manage the Qwen Proxy Server with multi-account support
+ * Standalone OAuth login - no dependency on qwen-code
  */
 
 import { spawn } from "child_process";
@@ -10,8 +11,16 @@ import { existsSync, readFileSync, writeFileSync, unlinkSync, mkdirSync, openSyn
 import { join } from "path";
 import { homedir } from "os";
 import { randomUUID } from "crypto";
+import { execSync } from "child_process";
 
-// Constants - use relative paths that work after bundling
+// Import OAuth functions
+import {
+  performDeviceAuthFlow,
+  refreshAccessToken,
+  isCredentialsExpired,
+} from "./auth/oauth.js";
+
+// Constants
 const QWEN_PROXY_DIR = join(homedir(), ".qwen-proxy");
 const PID_FILE = join(QWEN_PROXY_DIR, "server.pid");
 const LOG_FILE = join(QWEN_PROXY_DIR, "server.log");
@@ -35,12 +44,13 @@ Commands:
 
 Account Commands:
   account list        List all accounts
-  account add         Add a new account (from qwen-code)
+  account login       Login with new account (opens browser)
+  account logout      Logout and remove account
   account default     Set default account
   account enable      Enable an account
   account disable     Disable an account
-  account remove      Remove an account
-  account import      Import credentials from file
+  account refresh     Refresh token for an account
+  account rename      Rename an account
 
 Options:
   -v                  Show version
@@ -48,26 +58,25 @@ Options:
 
 Examples:
   qwen-proxy start
-  qwen-proxy start --port 8080
+  qwen-proxy account login --name work
   qwen-proxy account list
-  qwen-proxy account add --name work
-  qwen-proxy account default <account-id>
+  qwen-proxy account default work
 `;
 
 // Version
-function getVersion(): string {
-  return "1.1.0";
+function getVersion() {
+  return "1.2.0";
 }
 
 // Ensure directory exists
-function ensureDir(): void {
+function ensureDir() {
   if (!existsSync(QWEN_PROXY_DIR)) {
     mkdirSync(QWEN_PROXY_DIR, { recursive: true, mode: 0o700 });
   }
 }
 
 // Load config
-function loadConfig(): { port: number; host: string; routingStrategy: string } {
+function loadConfig() {
   try {
     if (existsSync(CONFIG_FILE)) {
       return JSON.parse(readFileSync(CONFIG_FILE, "utf-8"));
@@ -77,13 +86,13 @@ function loadConfig(): { port: number; host: string; routingStrategy: string } {
 }
 
 // Save config
-function saveConfig(config: { port: number; host: string; routingStrategy?: string }): void {
+function saveConfig(config) {
   ensureDir();
   writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2));
 }
 
 // Load accounts
-function loadAccountsData(): any {
+function loadAccountsData() {
   ensureDir();
   if (!existsSync(ACCOUNTS_FILE)) {
     return { accounts: {}, defaultAccountId: null };
@@ -96,13 +105,13 @@ function loadAccountsData(): any {
 }
 
 // Save accounts
-function saveAccountsData(data: any): void {
+function saveAccountsData(data) {
   ensureDir();
   writeFileSync(ACCOUNTS_FILE, JSON.stringify(data, null, 2), { mode: 0o600 });
 }
 
 // Check if server is running
-function isRunning(): { running: boolean; pid?: number; port?: number; host?: string } {
+function isRunning() {
   if (!existsSync(PID_FILE)) {
     return { running: false };
   }
@@ -123,72 +132,104 @@ function isRunning(): { running: boolean; pid?: number; port?: number; host?: st
   }
 }
 
+// Open URL in browser
+function openBrowser(url) {
+  const platform = process.platform;
+  try {
+    if (platform === "darwin") {
+      execSync(`open "${url}"`);
+    } else if (platform === "win32") {
+      execSync(`start "" "${url}"`);
+    } else {
+      // Linux - try common browsers
+      const browsers = ["xdg-open", "google-chrome", "firefox", "chromium"];
+      for (const browser of browsers) {
+        try {
+          execSync(`which ${browser}`);
+          execSync(`${browser} "${url}" >/dev/null 2>&1 &`);
+          return;
+        } catch {}
+      }
+    }
+  } catch {
+    // Fallback - just print the URL
+  }
+}
+
 // ============================================
 // Account Commands
 // ============================================
 
-function listAccounts(): void {
+function listAccounts() {
   const data = loadAccountsData();
-  const accounts = Object.values(data.accounts) as any[];
+  const accounts = Object.values(data.accounts);
 
   if (accounts.length === 0) {
     console.log("No accounts configured.");
-    console.log("\nTo add an account:");
-    console.log("  1. Run 'qwen-code auth login' to authenticate");
-    console.log("  2. Run 'qwen-proxy account import' to import credentials");
+    console.log("\nTo login with a new account:");
+    console.log("  qwen-proxy account login --name <account-name>");
     return;
   }
 
   console.log("Accounts:\n");
-  console.log("  ID                                    Name      Status      Default");
-  console.log("  " + "-".repeat(70));
+  console.log("  ID                                    Name            Status        Expires       Default");
+  console.log("  " + "-".repeat(85));
 
   for (const account of accounts) {
-    const isValid = Date.now() < account.credentials.expiryDate;
+    const expired = isCredentialsExpired(account.credentials);
     const status = account.enabled
-      ? (isValid ? "✓ valid" : "⚠ expired")
+      ? (expired ? "⚠ expired" : "✓ valid")
       : "✗ disabled";
+    const expires = account.credentials.expiryDate
+      ? formatExpiry(account.credentials.expiryDate)
+      : "never";
     const isDefault = account.id === data.defaultAccountId ? "★" : " ";
     
-    console.log(`  ${account.id.slice(0, 36)}  ${account.name.padEnd(9)} ${status.padEnd(11)} ${isDefault}`);
+    console.log(`  ${account.id.slice(0, 36)}  ${account.name.padEnd(15)} ${status.padEnd(13)} ${expires.padEnd(13)} ${isDefault}`);
   }
 
   console.log("");
   console.log(`Total: ${accounts.length} account(s)`);
-  console.log(`Active: ${accounts.filter(a => a.enabled && Date.now() < a.credentials.expiryDate).length} account(s)`);
+  console.log(`Active: ${accounts.filter(a => a.enabled && !isCredentialsExpired(a.credentials)).length} account(s)`);
 }
 
-function importAccount(name?: string): void {
-  const qwenCredsPath = join(homedir(), ".qwen", "oauth_creds.json");
-  
-  if (!existsSync(qwenCredsPath)) {
-    console.error("No qwen-code credentials found.");
-    console.log("Please authenticate first:");
-    console.log("  qwen-code auth login");
-    return;
-  }
+function formatExpiry(expiryDate) {
+  const seconds = Math.floor((expiryDate - Date.now()) / 1000);
+  if (seconds < 0) return "expired";
+  if (seconds < 60) return `${seconds}s`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h`;
+  return `${Math.floor(seconds / 86400)}d`;
+}
+
+async function loginAccount(name) {
+  const data = loadAccountsData();
+  const accountName = name || `account-${Object.keys(data.accounts).length + 1}`;
+
+  console.log(`\nStarting OAuth login for account "${accountName}"...\n`);
 
   try {
-    const creds = JSON.parse(readFileSync(qwenCredsPath, "utf-8"));
-    
-    if (!creds.access_token) {
-      console.error("Invalid credentials file.");
-      return;
-    }
+    const credentials = await performDeviceAuthFlow((url, userCode) => {
+      console.log("Opening browser for authentication...\n");
+      console.log(`  User Code: ${userCode}`);
+      console.log(`  URL: ${url}\n`);
+      console.log("If the browser does not open automatically, visit the URL above.\n");
+      
+      openBrowser(url);
+    });
 
-    const data = loadAccountsData();
     const accountId = randomUUID();
 
     data.accounts[accountId] = {
       id: accountId,
-      name: name || `account-${Object.keys(data.accounts).length + 1}`,
+      name: accountName,
       credentials: {
-        accessToken: creds.access_token,
-        tokenType: creds.token_type || "Bearer",
-        refreshToken: creds.refresh_token,
-        resourceUrl: creds.resource_url,
-        expiryDate: creds.expiry_date,
-        scope: creds.scope,
+        accessToken: credentials.accessToken,
+        tokenType: credentials.tokenType,
+        refreshToken: credentials.refreshToken,
+        resourceUrl: credentials.resourceUrl,
+        expiryDate: credentials.expiryDate,
+        scope: credentials.scope,
       },
       createdAt: Date.now(),
       lastUsed: null,
@@ -201,63 +242,81 @@ function importAccount(name?: string): void {
     }
 
     saveAccountsData(data);
-    console.log(`Account "${data.accounts[accountId].name}" added successfully.`);
-    console.log(`ID: ${accountId}`);
-  } catch (e) {
-    console.error("Failed to import account:", e);
+    
+    console.log(`\n✓ Account "${accountName}" logged in successfully!`);
+    console.log(`  ID: ${accountId}`);
+    console.log(`  Resource URL: ${credentials.resourceUrl || "portal.qwen.ai"}`);
+    console.log(`  Expires: ${formatExpiry(credentials.expiryDate)}`);
+  } catch (error) {
+    console.error("\n✗ Login failed:", error instanceof Error ? error.message : error);
+    process.exit(1);
   }
 }
 
-function setDefaultAccount(accountId: string): void {
+async function refreshAccount(accountId) {
   const data = loadAccountsData();
   
-  if (!data.accounts[accountId]) {
-    const found = Object.values(data.accounts).find((a: any) => a.name === accountId);
+  // Find account by ID or name
+  let account = data.accounts[accountId];
+  if (!account) {
+    const found = Object.values(data.accounts).find(a => a.name === accountId);
     if (found) {
-      accountId = (found as any).id;
-    } else {
-      console.error(`Account not found: ${accountId}`);
-      return;
+      account = found;
+      accountId = account.id;
     }
   }
 
-  data.defaultAccountId = accountId;
-  saveAccountsData(data);
-  console.log(`Default account set to: ${data.accounts[accountId].name}`);
+  if (!account) {
+    console.error(`Account not found: ${accountId}`);
+    process.exit(1);
+  }
+
+  if (!account.credentials.refreshToken) {
+    console.error(`Account "${account.name}" has no refresh token. Please login again.`);
+    process.exit(1);
+  }
+
+  console.log(`Refreshing token for account "${account.name}"...`);
+
+  try {
+    const newCredentials = await refreshAccessToken(account.credentials.refreshToken);
+    
+    data.accounts[accountId].credentials = {
+      accessToken: newCredentials.accessToken,
+      tokenType: newCredentials.tokenType,
+      refreshToken: newCredentials.refreshToken || account.credentials.refreshToken,
+      resourceUrl: newCredentials.resourceUrl,
+      expiryDate: newCredentials.expiryDate,
+      scope: newCredentials.scope,
+    };
+
+    saveAccountsData(data);
+    
+    console.log(`✓ Token refreshed for "${account.name}"`);
+    console.log(`  Expires: ${formatExpiry(newCredentials.expiryDate)}`);
+  } catch (error) {
+    console.error("✗ Failed to refresh token:", error instanceof Error ? error.message : error);
+    process.exit(1);
+  }
 }
 
-function toggleAccount(accountId: string, enabled: boolean): void {
+function logoutAccount(accountId) {
   const data = loadAccountsData();
   
-  if (!data.accounts[accountId]) {
-    const found = Object.values(data.accounts).find((a: any) => a.name === accountId);
+  // Find account by ID or name
+  let account = data.accounts[accountId];
+  if (!account) {
+    const found = Object.values(data.accounts).find(a => a.name === accountId);
     if (found) {
-      accountId = (found as any).id;
+      account = found;
+      accountId = account.id;
     } else {
       console.error(`Account not found: ${accountId}`);
-      return;
+      process.exit(1);
     }
   }
 
-  data.accounts[accountId].enabled = enabled;
-  saveAccountsData(data);
-  console.log(`Account "${data.accounts[accountId].name}" ${enabled ? "enabled" : "disabled"}.`);
-}
-
-function removeAccount(accountId: string): void {
-  const data = loadAccountsData();
-  
-  if (!data.accounts[accountId]) {
-    const found = Object.values(data.accounts).find((a: any) => a.name === accountId);
-    if (found) {
-      accountId = (found as any).id;
-    } else {
-      console.error(`Account not found: ${accountId}`);
-      return;
-    }
-  }
-
-  const name = data.accounts[accountId].name;
+  const name = account.name;
   delete data.accounts[accountId];
 
   if (data.defaultAccountId === accountId) {
@@ -266,14 +325,75 @@ function removeAccount(accountId: string): void {
   }
 
   saveAccountsData(data);
-  console.log(`Account "${name}" removed.`);
+  console.log(`✓ Account "${name}" logged out.`);
+}
+
+function setDefaultAccount(accountId) {
+  const data = loadAccountsData();
+  
+  let account = data.accounts[accountId];
+  if (!account) {
+    const found = Object.values(data.accounts).find(a => a.name === accountId);
+    if (found) {
+      account = found;
+      accountId = account.id;
+    } else {
+      console.error(`Account not found: ${accountId}`);
+      return;
+    }
+  }
+
+  data.defaultAccountId = accountId;
+  saveAccountsData(data);
+  console.log(`✓ Default account set to: ${data.accounts[accountId].name}`);
+}
+
+function toggleAccount(accountId, enabled) {
+  const data = loadAccountsData();
+  
+  let account = data.accounts[accountId];
+  if (!account) {
+    const found = Object.values(data.accounts).find(a => a.name === accountId);
+    if (found) {
+      account = found;
+      accountId = account.id;
+    } else {
+      console.error(`Account not found: ${accountId}`);
+      return;
+    }
+  }
+
+  data.accounts[accountId].enabled = enabled;
+  saveAccountsData(data);
+  console.log(`✓ Account "${data.accounts[accountId].name}" ${enabled ? "enabled" : "disabled"}.`);
+}
+
+function renameAccount(accountId, newName) {
+  const data = loadAccountsData();
+  
+  let account = data.accounts[accountId];
+  if (!account) {
+    const found = Object.values(data.accounts).find(a => a.name === accountId);
+    if (found) {
+      account = found;
+      accountId = account.id;
+    } else {
+      console.error(`Account not found: ${accountId}`);
+      return;
+    }
+  }
+
+  const oldName = account.name;
+  data.accounts[accountId].name = newName;
+  saveAccountsData(data);
+  console.log(`✓ Account renamed from "${oldName}" to "${newName}"`);
 }
 
 // ============================================
 // Server Commands
 // ============================================
 
-async function startServer(port?: number, host?: string): Promise<void> {
+async function startServer(port, host) {
   const status = isRunning();
   
   if (status.running) {
@@ -289,7 +409,7 @@ async function startServer(port?: number, host?: string): Promise<void> {
 
   saveConfig({ port: finalPort, host: finalHost, routingStrategy: config.routingStrategy });
 
-  // Find server.mjs relative to this script
+  // Find server.mjs
   const serverPathGlobal = join(homedir(), ".bun", "install", "global", "node_modules", "@ishan-parihar", "qwen-proxy", "dist", "server.mjs");
   const serverPathLocal = join(process.cwd(), "dist", "server.mjs");
   const serverPathDev = join(process.cwd(), "src", "server.js");
@@ -308,9 +428,8 @@ async function startServer(port?: number, host?: string): Promise<void> {
 
   console.log(`Starting Qwen Proxy Server on http://${finalHost}:${finalPort}...`);
 
-  // Open log files
-  const logFd = openSync(LOG_FILE, 'a');
-  const errorLogFd = openSync(ERROR_LOG_FILE, 'a');
+  const logFd = openSync(LOG_FILE, "a");
+  const errorLogFd = openSync(ERROR_LOG_FILE, "a");
 
   const serverProcess = spawn(process.execPath, [actualServerPath], {
     detached: true,
@@ -326,7 +445,6 @@ async function startServer(port?: number, host?: string): Promise<void> {
   serverProcess.unref();
   writeFileSync(PID_FILE, String(serverProcess.pid));
 
-  // Wait for server to start
   await new Promise((resolve) => setTimeout(resolve, 1500));
 
   const newStatus = isRunning();
@@ -346,7 +464,7 @@ async function startServer(port?: number, host?: string): Promise<void> {
   }
 }
 
-function stopServer(): void {
+function stopServer() {
   const status = isRunning();
 
   if (!status.running) {
@@ -355,7 +473,7 @@ function stopServer(): void {
   }
 
   try {
-    process.kill(status.pid!, "SIGTERM");
+    process.kill(status.pid, "SIGTERM");
     if (existsSync(PID_FILE)) {
       unlinkSync(PID_FILE);
     }
@@ -365,7 +483,7 @@ function stopServer(): void {
   }
 }
 
-function showStatus(): void {
+function showStatus() {
   const status = isRunning();
 
   if (!status.running) {
@@ -387,11 +505,11 @@ function showStatus(): void {
   console.log(`  GET  /accounts`);
 
   const data = loadAccountsData();
-  const accounts = Object.values(data.accounts) as any[];
+  const accounts = Object.values(data.accounts);
   
   console.log(`\nAccounts: ${accounts.length} configured`);
   if (accounts.length > 0) {
-    const active = accounts.filter(a => a.enabled && Date.now() < a.credentials.expiryDate).length;
+    const active = accounts.filter(a => a.enabled && !isCredentialsExpired(a.credentials)).length;
     console.log(`Active: ${active} account(s)`);
   }
 }
@@ -400,11 +518,11 @@ function showStatus(): void {
 // Main
 // ============================================
 
-function parseArgs(): { command: string; subcommand?: string; options: Record<string, any> } {
+function parseArgs() {
   const args = process.argv.slice(2);
   const command = args[0] || "help";
   const subcommand = args[1];
-  const options: Record<string, any> = {};
+  const options = {};
 
   for (let i = 1; i < args.length; i++) {
     if (args[i].startsWith("--")) {
@@ -417,7 +535,7 @@ function parseArgs(): { command: string; subcommand?: string; options: Record<st
   return { command, subcommand, options };
 }
 
-async function main(): Promise<void> {
+async function main() {
   const { command, subcommand, options } = parseArgs();
 
   if (command === "account") {
@@ -426,9 +544,17 @@ async function main(): Promise<void> {
       case "ls":
         listAccounts();
         break;
-      case "add":
-      case "import":
-        importAccount(options.name as string);
+      case "login":
+        await loginAccount(options.name);
+        break;
+      case "logout":
+      case "remove":
+      case "rm":
+        if (!process.argv[3] || process.argv[3].startsWith("--")) {
+          console.error("Usage: qwen-proxy account logout <account-id-or-name>");
+          process.exit(1);
+        }
+        logoutAccount(process.argv[3]);
         break;
       case "default":
         if (!process.argv[3]) {
@@ -451,29 +577,37 @@ async function main(): Promise<void> {
         }
         toggleAccount(process.argv[3], false);
         break;
-      case "remove":
-      case "rm":
+      case "refresh":
         if (!process.argv[3]) {
-          console.error("Usage: qwen-proxy account remove <account-id-or-name>");
+          console.error("Usage: qwen-proxy account refresh <account-id-or-name>");
           process.exit(1);
         }
-        removeAccount(process.argv[3]);
+        await refreshAccount(process.argv[3]);
+        break;
+      case "rename":
+        if (!process.argv[3] || !process.argv[4]) {
+          console.error("Usage: qwen-proxy account rename <account-id-or-name> <new-name>");
+          process.exit(1);
+        }
+        renameAccount(process.argv[3], process.argv[4]);
         break;
       default:
         console.log("Account commands:");
-        console.log("  list      List all accounts");
-        console.log("  add       Add a new account");
-        console.log("  default   Set default account");
-        console.log("  enable    Enable an account");
-        console.log("  disable   Disable an account");
-        console.log("  remove    Remove an account");
+        console.log("  list        List all accounts");
+        console.log("  login       Login with new account (opens browser)");
+        console.log("  logout      Logout and remove account");
+        console.log("  default     Set default account");
+        console.log("  enable      Enable an account");
+        console.log("  disable     Disable an account");
+        console.log("  refresh     Refresh token for an account");
+        console.log("  rename      Rename an account");
     }
     return;
   }
 
   switch (command) {
     case "start":
-      await startServer(options.port as number | undefined, options.host as string | undefined);
+      await startServer(options.port, options.host);
       break;
 
     case "stop":

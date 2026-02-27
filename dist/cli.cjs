@@ -1,12 +1,167 @@
 #!/usr/bin/env node
 "use strict";
 
-// src/cli.ts
+// src/cli.js
 var import_child_process = require("child_process");
 var import_fs = require("fs");
 var import_path = require("path");
 var import_os = require("os");
 var import_crypto = require("crypto");
+var import_child_process2 = require("child_process");
+
+// src/auth/oauth.js
+var import_node_crypto = require("node:crypto");
+var OAUTH_CONFIG = {
+  baseUrl: "https://chat.qwen.ai",
+  deviceCodeEndpoint: "https://chat.qwen.ai/api/v1/oauth2/device/code",
+  tokenEndpoint: "https://chat.qwen.ai/api/v1/oauth2/token",
+  clientId: "f0304373b74a44d2b584a3fb70ca9e56",
+  scope: "openid profile email model.completion",
+  grantType: "urn:ietf:params:oauth:grant-type:device_code"
+};
+var TOKEN_REFRESH_BUFFER_MS = 30 * 1e3;
+var SlowDownError = class extends Error {
+  constructor() {
+    super("slow_down: server requested increased polling interval");
+    this.name = "SlowDownError";
+  }
+};
+function generatePKCE() {
+  const verifier = (0, import_node_crypto.randomBytes)(32).toString("base64url");
+  const challenge = (0, import_node_crypto.createHash)("sha256").update(verifier).digest("base64url");
+  return { verifier, challenge };
+}
+function objectToUrlEncoded(data) {
+  return Object.keys(data).map((key) => `${encodeURIComponent(key)}=${encodeURIComponent(data[key])}`).join("&");
+}
+async function requestDeviceAuthorization(codeChallenge) {
+  const bodyData = {
+    client_id: OAUTH_CONFIG.clientId,
+    scope: OAUTH_CONFIG.scope,
+    code_challenge: codeChallenge,
+    code_challenge_method: "S256"
+  };
+  const response = await fetch(OAUTH_CONFIG.deviceCodeEndpoint, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+      Accept: "application/json",
+      "x-request-id": (0, import_node_crypto.randomUUID)()
+    },
+    body: objectToUrlEncoded(bodyData)
+  });
+  if (!response.ok) {
+    const errorData = await response.text();
+    throw new Error(`Device auth failed: HTTP ${response.status}: ${errorData}`);
+  }
+  const result = await response.json();
+  if (!result.device_code || !result.user_code) {
+    throw new Error("Invalid device authorization response");
+  }
+  return result;
+}
+async function pollDeviceToken(deviceCode, codeVerifier) {
+  const bodyData = {
+    grant_type: OAUTH_CONFIG.grantType,
+    client_id: OAUTH_CONFIG.clientId,
+    device_code: deviceCode,
+    code_verifier: codeVerifier
+  };
+  const response = await fetch(OAUTH_CONFIG.tokenEndpoint, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+      Accept: "application/json"
+    },
+    body: objectToUrlEncoded(bodyData)
+  });
+  if (!response.ok) {
+    const responseText = await response.text();
+    try {
+      const errorData = JSON.parse(responseText);
+      if (response.status === 400 && errorData.error === "authorization_pending") {
+        return null;
+      }
+      if (response.status === 429 && errorData.error === "slow_down") {
+        throw new SlowDownError();
+      }
+      throw new Error(`Token poll failed: ${errorData.error || responseText}`);
+    } catch (parseError) {
+      if (parseError instanceof SyntaxError) {
+        throw new Error(`Token poll failed: ${response.status} ${response.statusText}`);
+      }
+      throw parseError;
+    }
+  }
+  return await response.json();
+}
+function tokenResponseToCredentials(tokenResponse) {
+  return {
+    accessToken: tokenResponse.access_token,
+    tokenType: tokenResponse.token_type || "Bearer",
+    refreshToken: tokenResponse.refresh_token,
+    resourceUrl: tokenResponse.resource_url,
+    expiryDate: Date.now() + tokenResponse.expires_in * 1e3,
+    scope: tokenResponse.scope
+  };
+}
+async function refreshAccessToken(refreshToken) {
+  const bodyData = {
+    grant_type: "refresh_token",
+    refresh_token: refreshToken,
+    client_id: OAUTH_CONFIG.clientId
+  };
+  const response = await fetch(OAUTH_CONFIG.tokenEndpoint, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+      Accept: "application/json"
+    },
+    body: objectToUrlEncoded(bodyData)
+  });
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Token refresh failed: HTTP ${response.status}: ${errorText}`);
+  }
+  const data = await response.json();
+  return {
+    accessToken: data.access_token,
+    tokenType: data.token_type || "Bearer",
+    refreshToken: data.refresh_token || refreshToken,
+    resourceUrl: data.resource_url,
+    expiryDate: Date.now() + data.expires_in * 1e3,
+    scope: data.scope
+  };
+}
+function isCredentialsExpired(credentials) {
+  if (!credentials.expiryDate) return false;
+  return Date.now() > credentials.expiryDate - TOKEN_REFRESH_BUFFER_MS;
+}
+async function performDeviceAuthFlow(onVerificationUrl, pollIntervalMs = 2e3, timeoutMs = 5 * 60 * 1e3) {
+  const { verifier, challenge } = generatePKCE();
+  const deviceAuth = await requestDeviceAuthorization(challenge);
+  onVerificationUrl(deviceAuth.verification_uri_complete, deviceAuth.user_code);
+  const startTime = Date.now();
+  let interval = pollIntervalMs;
+  while (Date.now() - startTime < timeoutMs) {
+    await new Promise((resolve) => setTimeout(resolve, interval));
+    try {
+      const tokenResponse = await pollDeviceToken(deviceAuth.device_code, verifier);
+      if (tokenResponse) {
+        return tokenResponseToCredentials(tokenResponse);
+      }
+    } catch (error) {
+      if (error instanceof SlowDownError) {
+        interval = Math.min(interval * 1.5, 1e4);
+      } else {
+        throw error;
+      }
+    }
+  }
+  throw new Error("Device authorization timeout");
+}
+
+// src/cli.js
 var QWEN_PROXY_DIR = (0, import_path.join)((0, import_os.homedir)(), ".qwen-proxy");
 var PID_FILE = (0, import_path.join)(QWEN_PROXY_DIR, "server.pid");
 var LOG_FILE = (0, import_path.join)(QWEN_PROXY_DIR, "server.log");
@@ -28,12 +183,13 @@ Commands:
 
 Account Commands:
   account list        List all accounts
-  account add         Add a new account (from qwen-code)
+  account login       Login with new account (opens browser)
+  account logout      Logout and remove account
   account default     Set default account
   account enable      Enable an account
   account disable     Disable an account
-  account remove      Remove an account
-  account import      Import credentials from file
+  account refresh     Refresh token for an account
+  account rename      Rename an account
 
 Options:
   -v                  Show version
@@ -41,13 +197,12 @@ Options:
 
 Examples:
   qwen-proxy start
-  qwen-proxy start --port 8080
+  qwen-proxy account login --name work
   qwen-proxy account list
-  qwen-proxy account add --name work
-  qwen-proxy account default <account-id>
+  qwen-proxy account default work
 `;
 function getVersion() {
-  return "1.1.0";
+  return "1.2.0";
 }
 function ensureDir() {
   if (!(0, import_fs.existsSync)(QWEN_PROXY_DIR)) {
@@ -100,55 +255,84 @@ function isRunning() {
     return { running: false };
   }
 }
+function openBrowser(url) {
+  const platform = process.platform;
+  try {
+    if (platform === "darwin") {
+      (0, import_child_process2.execSync)(`open "${url}"`);
+    } else if (platform === "win32") {
+      (0, import_child_process2.execSync)(`start "" "${url}"`);
+    } else {
+      const browsers = ["xdg-open", "google-chrome", "firefox", "chromium"];
+      for (const browser of browsers) {
+        try {
+          (0, import_child_process2.execSync)(`which ${browser}`);
+          (0, import_child_process2.execSync)(`${browser} "${url}" >/dev/null 2>&1 &`);
+          return;
+        } catch {
+        }
+      }
+    }
+  } catch {
+  }
+}
 function listAccounts() {
   const data = loadAccountsData();
   const accounts = Object.values(data.accounts);
   if (accounts.length === 0) {
     console.log("No accounts configured.");
-    console.log("\nTo add an account:");
-    console.log("  1. Run 'qwen-code auth login' to authenticate");
-    console.log("  2. Run 'qwen-proxy account import' to import credentials");
+    console.log("\nTo login with a new account:");
+    console.log("  qwen-proxy account login --name <account-name>");
     return;
   }
   console.log("Accounts:\n");
-  console.log("  ID                                    Name      Status      Default");
-  console.log("  " + "-".repeat(70));
+  console.log("  ID                                    Name            Status        Expires       Default");
+  console.log("  " + "-".repeat(85));
   for (const account of accounts) {
-    const isValid = Date.now() < account.credentials.expiryDate;
-    const status = account.enabled ? isValid ? "\u2713 valid" : "\u26A0 expired" : "\u2717 disabled";
+    const expired = isCredentialsExpired(account.credentials);
+    const status = account.enabled ? expired ? "\u26A0 expired" : "\u2713 valid" : "\u2717 disabled";
+    const expires = account.credentials.expiryDate ? formatExpiry(account.credentials.expiryDate) : "never";
     const isDefault = account.id === data.defaultAccountId ? "\u2605" : " ";
-    console.log(`  ${account.id.slice(0, 36)}  ${account.name.padEnd(9)} ${status.padEnd(11)} ${isDefault}`);
+    console.log(`  ${account.id.slice(0, 36)}  ${account.name.padEnd(15)} ${status.padEnd(13)} ${expires.padEnd(13)} ${isDefault}`);
   }
   console.log("");
   console.log(`Total: ${accounts.length} account(s)`);
-  console.log(`Active: ${accounts.filter((a) => a.enabled && Date.now() < a.credentials.expiryDate).length} account(s)`);
+  console.log(`Active: ${accounts.filter((a) => a.enabled && !isCredentialsExpired(a.credentials)).length} account(s)`);
 }
-function importAccount(name) {
-  const qwenCredsPath = (0, import_path.join)((0, import_os.homedir)(), ".qwen", "oauth_creds.json");
-  if (!(0, import_fs.existsSync)(qwenCredsPath)) {
-    console.error("No qwen-code credentials found.");
-    console.log("Please authenticate first:");
-    console.log("  qwen-code auth login");
-    return;
-  }
+function formatExpiry(expiryDate) {
+  const seconds = Math.floor((expiryDate - Date.now()) / 1e3);
+  if (seconds < 0) return "expired";
+  if (seconds < 60) return `${seconds}s`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h`;
+  return `${Math.floor(seconds / 86400)}d`;
+}
+async function loginAccount(name) {
+  const data = loadAccountsData();
+  const accountName = name || `account-${Object.keys(data.accounts).length + 1}`;
+  console.log(`
+Starting OAuth login for account "${accountName}"...
+`);
   try {
-    const creds = JSON.parse((0, import_fs.readFileSync)(qwenCredsPath, "utf-8"));
-    if (!creds.access_token) {
-      console.error("Invalid credentials file.");
-      return;
-    }
-    const data = loadAccountsData();
+    const credentials = await performDeviceAuthFlow((url, userCode) => {
+      console.log("Opening browser for authentication...\n");
+      console.log(`  User Code: ${userCode}`);
+      console.log(`  URL: ${url}
+`);
+      console.log("If the browser does not open automatically, visit the URL above.\n");
+      openBrowser(url);
+    });
     const accountId = (0, import_crypto.randomUUID)();
     data.accounts[accountId] = {
       id: accountId,
-      name: name || `account-${Object.keys(data.accounts).length + 1}`,
+      name: accountName,
       credentials: {
-        accessToken: creds.access_token,
-        tokenType: creds.token_type || "Bearer",
-        refreshToken: creds.refresh_token,
-        resourceUrl: creds.resource_url,
-        expiryDate: creds.expiry_date,
-        scope: creds.scope
+        accessToken: credentials.accessToken,
+        tokenType: credentials.tokenType,
+        refreshToken: credentials.refreshToken,
+        resourceUrl: credentials.resourceUrl,
+        expiryDate: credentials.expiryDate,
+        scope: credentials.scope
       },
       createdAt: Date.now(),
       lastUsed: null,
@@ -159,18 +343,83 @@ function importAccount(name) {
       data.defaultAccountId = accountId;
     }
     saveAccountsData(data);
-    console.log(`Account "${data.accounts[accountId].name}" added successfully.`);
-    console.log(`ID: ${accountId}`);
-  } catch (e) {
-    console.error("Failed to import account:", e);
+    console.log(`
+\u2713 Account "${accountName}" logged in successfully!`);
+    console.log(`  ID: ${accountId}`);
+    console.log(`  Resource URL: ${credentials.resourceUrl || "portal.qwen.ai"}`);
+    console.log(`  Expires: ${formatExpiry(credentials.expiryDate)}`);
+  } catch (error) {
+    console.error("\n\u2717 Login failed:", error instanceof Error ? error.message : error);
+    process.exit(1);
   }
+}
+async function refreshAccount(accountId) {
+  const data = loadAccountsData();
+  let account = data.accounts[accountId];
+  if (!account) {
+    const found = Object.values(data.accounts).find((a) => a.name === accountId);
+    if (found) {
+      account = found;
+      accountId = account.id;
+    }
+  }
+  if (!account) {
+    console.error(`Account not found: ${accountId}`);
+    process.exit(1);
+  }
+  if (!account.credentials.refreshToken) {
+    console.error(`Account "${account.name}" has no refresh token. Please login again.`);
+    process.exit(1);
+  }
+  console.log(`Refreshing token for account "${account.name}"...`);
+  try {
+    const newCredentials = await refreshAccessToken(account.credentials.refreshToken);
+    data.accounts[accountId].credentials = {
+      accessToken: newCredentials.accessToken,
+      tokenType: newCredentials.tokenType,
+      refreshToken: newCredentials.refreshToken || account.credentials.refreshToken,
+      resourceUrl: newCredentials.resourceUrl,
+      expiryDate: newCredentials.expiryDate,
+      scope: newCredentials.scope
+    };
+    saveAccountsData(data);
+    console.log(`\u2713 Token refreshed for "${account.name}"`);
+    console.log(`  Expires: ${formatExpiry(newCredentials.expiryDate)}`);
+  } catch (error) {
+    console.error("\u2717 Failed to refresh token:", error instanceof Error ? error.message : error);
+    process.exit(1);
+  }
+}
+function logoutAccount(accountId) {
+  const data = loadAccountsData();
+  let account = data.accounts[accountId];
+  if (!account) {
+    const found = Object.values(data.accounts).find((a) => a.name === accountId);
+    if (found) {
+      account = found;
+      accountId = account.id;
+    } else {
+      console.error(`Account not found: ${accountId}`);
+      process.exit(1);
+    }
+  }
+  const name = account.name;
+  delete data.accounts[accountId];
+  if (data.defaultAccountId === accountId) {
+    const remaining = Object.keys(data.accounts);
+    data.defaultAccountId = remaining.length > 0 ? remaining[0] : null;
+  }
+  saveAccountsData(data);
+  console.log(`\u2713 Account "${name}" logged out.`);
 }
 function setDefaultAccount(accountId) {
   const data = loadAccountsData();
-  if (!data.accounts[accountId]) {
+  let account = data.accounts[accountId];
+  if (!account) {
     const found = Object.values(data.accounts).find((a) => a.name === accountId);
     if (found) {
-      accountId = found.id;
+      account = found;
+      accountId = account.id;
     } else {
       console.error(`Account not found: ${accountId}`);
       return;
@@ -178,14 +427,16 @@ function setDefaultAccount(accountId) {
   }
   data.defaultAccountId = accountId;
   saveAccountsData(data);
-  console.log(`Default account set to: ${data.accounts[accountId].name}`);
+  console.log(`\u2713 Default account set to: ${data.accounts[accountId].name}`);
 }
 function toggleAccount(accountId, enabled) {
   const data = loadAccountsData();
-  if (!data.accounts[accountId]) {
+  let account = data.accounts[accountId];
+  if (!account) {
     const found = Object.values(data.accounts).find((a) => a.name === accountId);
     if (found) {
-      accountId = found.id;
+      account = found;
+      accountId = account.id;
     } else {
       console.error(`Account not found: ${accountId}`);
       return;
@@ -193,27 +444,25 @@ function toggleAccount(accountId, enabled) {
   }
   data.accounts[accountId].enabled = enabled;
   saveAccountsData(data);
-  console.log(`Account "${data.accounts[accountId].name}" ${enabled ? "enabled" : "disabled"}.`);
+  console.log(`\u2713 Account "${data.accounts[accountId].name}" ${enabled ? "enabled" : "disabled"}.`);
 }
-function removeAccount(accountId) {
+function renameAccount(accountId, newName) {
   const data = loadAccountsData();
-  if (!data.accounts[accountId]) {
+  let account = data.accounts[accountId];
+  if (!account) {
     const found = Object.values(data.accounts).find((a) => a.name === accountId);
     if (found) {
-      accountId = found.id;
+      account = found;
+      accountId = account.id;
     } else {
       console.error(`Account not found: ${accountId}`);
       return;
     }
   }
-  const name = data.accounts[accountId].name;
-  delete data.accounts[accountId];
-  if (data.defaultAccountId === accountId) {
-    const remaining = Object.keys(data.accounts);
-    data.defaultAccountId = remaining.length > 0 ? remaining[0] : null;
-  }
+  const oldName = account.name;
+  data.accounts[accountId].name = newName;
   saveAccountsData(data);
-  console.log(`Account "${name}" removed.`);
+  console.log(`\u2713 Account renamed from "${oldName}" to "${newName}"`);
 }
 async function startServer(port, host) {
   const status = isRunning();
@@ -313,7 +562,7 @@ Endpoints:`);
   console.log(`
 Accounts: ${accounts.length} configured`);
   if (accounts.length > 0) {
-    const active = accounts.filter((a) => a.enabled && Date.now() < a.credentials.expiryDate).length;
+    const active = accounts.filter((a) => a.enabled && !isCredentialsExpired(a.credentials)).length;
     console.log(`Active: ${active} account(s)`);
   }
 }
@@ -339,9 +588,17 @@ async function main() {
       case "ls":
         listAccounts();
         break;
-      case "add":
-      case "import":
-        importAccount(options.name);
+      case "login":
+        await loginAccount(options.name);
+        break;
+      case "logout":
+      case "remove":
+      case "rm":
+        if (!process.argv[3] || process.argv[3].startsWith("--")) {
+          console.error("Usage: qwen-proxy account logout <account-id-or-name>");
+          process.exit(1);
+        }
+        logoutAccount(process.argv[3]);
         break;
       case "default":
         if (!process.argv[3]) {
@@ -364,22 +621,30 @@ async function main() {
         }
         toggleAccount(process.argv[3], false);
         break;
-      case "remove":
-      case "rm":
+      case "refresh":
         if (!process.argv[3]) {
-          console.error("Usage: qwen-proxy account remove <account-id-or-name>");
+          console.error("Usage: qwen-proxy account refresh <account-id-or-name>");
           process.exit(1);
         }
-        removeAccount(process.argv[3]);
+        await refreshAccount(process.argv[3]);
+        break;
+      case "rename":
+        if (!process.argv[3] || !process.argv[4]) {
+          console.error("Usage: qwen-proxy account rename <account-id-or-name> <new-name>");
+          process.exit(1);
+        }
+        renameAccount(process.argv[3], process.argv[4]);
         break;
       default:
         console.log("Account commands:");
-        console.log("  list      List all accounts");
-        console.log("  add       Add a new account");
-        console.log("  default   Set default account");
-        console.log("  enable    Enable an account");
-        console.log("  disable   Disable an account");
-        console.log("  remove    Remove an account");
+        console.log("  list        List all accounts");
+        console.log("  login       Login with new account (opens browser)");
+        console.log("  logout      Logout and remove account");
+        console.log("  default     Set default account");
+        console.log("  enable      Enable an account");
+        console.log("  disable     Disable an account");
+        console.log("  refresh     Refresh token for an account");
+        console.log("  rename      Rename an account");
     }
     return;
   }
