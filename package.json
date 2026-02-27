@@ -1,0 +1,16 @@
+{
+  "name": "qwen-proxy",
+  "version": "1.0.0",
+  "description": "OpenAI-compatible proxy server for Qwen OAuth API",
+  "type": "module",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js"
+  },
+  "keywords": ["qwen", "proxy", "openai", "oauth"],
+  "license": "MIT",
+  "dependencies": {
+    "express": "^4.18.2"
+  }
+}
