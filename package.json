@@ -1,7 +1,7 @@
 {
   "name": "@ishan-parihar/qwen-proxy",
   "version": "1.0.0",
-  "description": "OpenAI-compatible proxy server for Qwen OAuth API",
+  "description": "OpenAI-compatible proxy server for Qwen OAuth API with CLI and systemd service support",
   "bin": {
     "qwen-proxy": "dist/qwen-proxy"
   },
@@ -9,11 +9,30 @@
   "scripts": {
     "build": "node scripts/build.cjs",
     "start": "node src/server.js",
-    "dev": "node --watch src/server.js"
+    "dev": "node --watch src/server.js",
+    "prepublishOnly": "npm run build"
   },
-  "keywords": ["qwen", "proxy", "openai", "oauth", "cli"],
+  "keywords": [
+    "qwen",
+    "proxy",
+    "openai",
+    "oauth",
+    "cli",
+    "systemd",
+    "qwen-code",
+    "dashscope",
+    "api-proxy"
+  ],
   "author": "ishan-parihar",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ishan-parihar/qwen-proxy.git"
+  },
+  "homepage": "https://github.com/ishan-parihar/qwen-proxy#readme",
+  "bugs": {
+    "url": "https://github.com/ishan-parihar/qwen-proxy/issues"
+  },
   "dependencies": {
     "express": "^4.18.2"
   },
@@ -28,6 +47,7 @@
   },
   "files": [
     "dist",
+    "setup-systemd.sh",
     "README.md"
   ]
 }
